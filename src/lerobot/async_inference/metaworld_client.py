@@ -37,7 +37,6 @@ python -m lerobot.async_inference.metaworld_client \
 """
 
 import logging
-import pickle  # nosec
 import threading
 import time
 from collections.abc import Iterable
@@ -48,17 +47,16 @@ from typing import Any
 
 import grpc
 import numpy as np
-import torch
 
 from lerobot.async_inference.configs import get_aggregate_function
 from lerobot.async_inference.helpers import (
     FPSTracker,
     RemotePolicyConfig,
-    TimedAction,
-    TimedObservation,
     get_logger,
+    map_robot_keys_to_lerobot_features,
     visualize_action_queue_size,
 )
+from lerobot.async_inference.robot_client import RobotClient
 from lerobot.configs import parser
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.envs.configs import MetaworldEnv as MetaworldEnvConfig
@@ -71,7 +69,7 @@ from lerobot.transport import (
     services_pb2,  # type: ignore
     services_pb2_grpc,  # type: ignore
 )
-from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
+from lerobot.transport.utils import grpc_channel_options
 from lerobot.utils.constants import OBS_IMAGE
 from lerobot.utils.import_utils import register_third_party_plugins
 
@@ -85,25 +83,6 @@ def _expand_metaworld_tasks(task: str) -> list[str]:
     for item in task_groups:
         expanded.extend(DIFFICULTY_TO_TASKS.get(item, [item]))
     return expanded
-
-
-def _build_lerobot_features(obs_type: str, image_shape: tuple[int, int, int]) -> dict[str, dict[str, Any]]:
-    features: dict[str, dict[str, Any]] = {
-        "observation.images.top": {
-            "dtype": "image",
-            "shape": image_shape,
-            "names": ["height", "width", "channels"],
-        }
-    }
-
-    if obs_type == "pixels_agent_pos":
-        features["observation.state"] = {
-            "dtype": "float32",
-            "shape": (4,),
-            "names": [f"agent_pos_{idx}" for idx in range(4)],
-        }
-
-    return features
 
 
 def _make_rename_map(policy_cfg: PreTrainedConfig) -> dict[str, str]:
@@ -127,6 +106,10 @@ class AsyncMetaWorldClientConfig:
     )
     aggregate_fn_name: str = field(
         default="weighted_average", metadata={"help": "How to merge overlapping action chunks"}
+    )
+    client_device: str = field(
+        default="cpu",
+        metadata={"help": "Device to move received actions to before stepping the simulator"},
     )
     debug_visualize_queue_size: bool = field(default=False, metadata={"help": "Plot queue size after run"})
 
@@ -153,298 +136,252 @@ class AsyncMetaWorldClientConfig:
 
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
+    @property
+    def fps(self) -> int:
+        return self.env.fps
+
+    @property
+    def environment_dt(self) -> float:
+        return 1 / self.env.fps
+
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
         return ["policy"]
 
 
-class AsyncMetaWorldClient:
-    logger = get_logger("metaworld_client")
+class MetaWorldRobotAdapter:
+    def __init__(self, env_cfg: MetaworldEnvConfig):
+        self.env_cfg = env_cfg
+        self._connected = False
+        self._env: SingleMetaworldEnv | None = None
+        self._task_description = ""
+        self._observation: dict[str, Any] | None = None
+        self._reward_sum = 0.0
+        self._success = False
+        self._steps = 0
+        self._terminated = False
+        self._truncated = False
+
+        image_feature = env_cfg.features.get("pixels/top") or env_cfg.features.get("top")
+        if image_feature is None:
+            raise ValueError("MetaWorld async eval requires an image observation feature.")
+
+        action_feature = env_cfg.features["action"]
+        self._image_shape = tuple(image_feature.shape)
+        self._action_dim = action_feature.shape[0]
+
+    @property
+    def observation_features(self) -> dict[str, type | tuple]:
+        features: dict[str, type | tuple] = {"top": self._image_shape}
+        if self.env_cfg.obs_type == "pixels_agent_pos":
+            for idx in range(4):
+                features[f"agent_pos_{idx}"] = float
+        return features
+
+    @property
+    def action_features(self) -> dict[str, type]:
+        return {f"action_{idx}": float for idx in range(self._action_dim)}
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    @property
+    def task_description(self) -> str:
+        return self._task_description
+
+    @property
+    def episode_finished(self) -> bool:
+        return self._terminated or self._truncated or self._steps >= self.env_cfg.episode_length
+
+    @property
+    def steps(self) -> int:
+        return self._steps
+
+    def connect(self, calibrate: bool = True) -> None:
+        del calibrate
+        self._connected = True
+
+    @property
+    def is_calibrated(self) -> bool:
+        return True
+
+    def calibrate(self) -> None:
+        return None
+
+    def configure(self) -> None:
+        return None
+
+    def disconnect(self) -> None:
+        self._connected = False
+        self._env = None
+        self._observation = None
+
+    def start_episode(
+        self,
+        env: SingleMetaworldEnv,
+        *,
+        task_description: str,
+        seed: int,
+    ) -> None:
+        if not self.is_connected:
+            raise RuntimeError("MetaWorld adapter is not connected.")
+
+        self._env = env
+        self._task_description = task_description
+        self._reward_sum = 0.0
+        self._success = False
+        self._steps = 0
+        self._terminated = False
+        self._truncated = False
+        self._observation, _ = env.reset(seed=seed)
+
+    def get_observation(self) -> dict[str, Any]:
+        if not self.is_connected:
+            raise RuntimeError("MetaWorld adapter is not connected.")
+        if self._observation is None:
+            raise RuntimeError("Episode has not been reset yet.")
+
+        raw_observation: dict[str, Any] = {"top": self._observation["pixels"]}
+        if "agent_pos" in self._observation:
+            agent_pos = np.asarray(self._observation["agent_pos"], dtype=np.float32)
+            for idx, value in enumerate(agent_pos):
+                raw_observation[f"agent_pos_{idx}"] = float(value)
+
+        return raw_observation
+
+    def send_action(self, action: dict[str, float]) -> dict[str, float]:
+        if not self.is_connected:
+            raise RuntimeError("MetaWorld adapter is not connected.")
+        if self._env is None:
+            raise RuntimeError("Episode has not been started yet.")
+
+        action_np = np.asarray([action[key] for key in self.action_features], dtype=np.float32)
+        self._observation, reward, self._terminated, self._truncated, info = self._env.step(action_np)
+        self._reward_sum += float(reward)
+        self._success = self._success or bool(info.get("is_success", False))
+        self._steps += 1
+        return action
+
+    def build_result(self, task_name: str, seed: int) -> dict[str, Any]:
+        return {
+            "task": task_name,
+            "seed": seed,
+            "steps": self._steps,
+            "reward_sum": self._reward_sum,
+            "success": self._success,
+        }
+
+
+class AsyncMetaWorldClient(RobotClient):
+    prefix = "metaworld_client"
+    logger = get_logger(prefix)
 
     def __init__(self, cfg: AsyncMetaWorldClientConfig):
         self.cfg = cfg
-        self.shutdown_event = threading.Event()
+        self.config = cfg
+        self.robot = MetaWorldRobotAdapter(cfg.env)
+        self.robot.connect()
+
+        self.server_address = cfg.server_address
+        lerobot_features = map_robot_keys_to_lerobot_features(self.robot)
+        self.policy_config = RemotePolicyConfig(
+            policy_type=cfg.policy.type,
+            pretrained_name_or_path=str(cfg.policy.pretrained_path),
+            lerobot_features=lerobot_features,
+            actions_per_chunk=cfg.actions_per_chunk,
+            device=cfg.policy.device or "cpu",
+            rename_map=_make_rename_map(cfg.policy),
+        )
+
         self.channel = grpc.insecure_channel(
-            cfg.server_address, grpc_channel_options(initial_backoff=f"{1 / cfg.env.fps:.4f}s")
+            self.server_address, grpc_channel_options(initial_backoff=f"{cfg.environment_dt:.4f}s")
         )
         self.stub = services_pb2_grpc.AsyncInferenceStub(self.channel)
+        self.logger.info(f"Initializing client to connect to server at {self.server_address}")
 
-        self.action_queue: Queue[TimedAction] = Queue()
-        self.action_queue_lock = threading.Lock()
+        self.shutdown_event = threading.Event()
         self.latest_action_lock = threading.Lock()
         self.latest_action = -1
-        self.action_chunk_size = cfg.actions_per_chunk
-        self.observation_in_flight = threading.Event()
+        self.action_chunk_size = -1
+
+        self._chunk_size_threshold = cfg.chunk_size_threshold
+        self.action_queue = Queue()
+        self.action_queue_lock = threading.Lock()
+        self.action_queue_size: list[int] = []
+        self.start_barrier = threading.Barrier(2)
+
+        self.fps_tracker = FPSTracker(target_fps=self.config.fps)
         self.must_go = threading.Event()
         self.must_go.set()
 
-        self.action_queue_size: list[int] = []
-        self.fps_tracker = FPSTracker(target_fps=cfg.env.fps)
-
-        self.lerobot_features: dict[str, dict[str, Any]] | None = None
-        self.policy_setup_sent = False
-        self._current_task_name = ""
-        self._current_task_description = ""
-
-    @property
-    def running(self) -> bool:
-        return not self.shutdown_event.is_set()
-
-    def start(self):
-        self.stub.Ready(services_pb2.Empty())
-        self.logger.info(f"Connected to policy server at {self.cfg.server_address}")
-
-    def stop(self):
-        self.shutdown_event.set()
-        self.channel.close()
+        self.logger.info("MetaWorld adapter connected and ready")
 
     def _reset_episode_state(self):
+        self.stub.Ready(services_pb2.Empty())
+
         with self.latest_action_lock:
             self.latest_action = -1
+        self.action_chunk_size = -1
+
         with self.action_queue_lock:
             self.action_queue = Queue()
-        self.observation_in_flight.clear()
+
         self.must_go.set()
+        self.fps_tracker.reset()
 
-    def _ensure_policy_setup(self, first_observation: dict[str, Any]):
-        if self.policy_setup_sent:
-            return
-
-        image = first_observation["pixels"]
-        self.lerobot_features = _build_lerobot_features(self.cfg.env.obs_type, tuple(image.shape))
-
-        policy_config = RemotePolicyConfig(
-            policy_type=self.cfg.policy.type,
-            pretrained_name_or_path=str(self.cfg.policy.pretrained_path),
-            lerobot_features=self.lerobot_features,
-            actions_per_chunk=self.cfg.actions_per_chunk,
-            device=self.cfg.policy.device or "cpu",
-            rename_map=_make_rename_map(self.cfg.policy),
-        )
-        self.stub.SendPolicyInstructions(services_pb2.PolicySetup(data=pickle.dumps(policy_config)))
-        self.policy_setup_sent = True
-
-        self.logger.info(
-            "Sent policy setup | "
-            f"policy_type={policy_config.policy_type} | "
-            f"actions_per_chunk={policy_config.actions_per_chunk} | "
-            f"device={policy_config.device}"
-        )
-
-    def _flatten_observation(self, observation: dict[str, Any]) -> dict[str, Any]:
-        flattened: dict[str, Any] = {
-            "top": observation["pixels"],
-            "task": self._current_task_description,
-        }
-        if "agent_pos" in observation:
-            agent_pos = np.asarray(observation["agent_pos"], dtype=np.float32)
-            for idx, value in enumerate(agent_pos):
-                flattened[f"agent_pos_{idx}"] = float(value)
-        return flattened
-
-    def _aggregate_action_queues(self, incoming_actions: list[TimedAction]):
-        future_action_queue: Queue[TimedAction] = Queue()
-        with self.action_queue_lock:
-            current_queue = {action.get_timestep(): action for action in self.action_queue.queue}
-
-        with self.latest_action_lock:
-            latest_action = self.latest_action
-
-        for incoming in incoming_actions:
-            timestep = incoming.get_timestep()
-            if timestep <= latest_action:
-                continue
-
-            if timestep not in current_queue:
-                future_action_queue.put(incoming)
-                continue
-
-            existing = current_queue[timestep]
-            future_action_queue.put(
-                TimedAction(
-                    timestamp=incoming.get_timestamp(),
-                    timestep=timestep,
-                    action=self.cfg.aggregate_fn(existing.get_action(), incoming.get_action()),
-                )
-            )
-
-        incoming_timesteps = {action.get_timestep() for action in incoming_actions}
-        for timestep, existing in sorted(current_queue.items()):
-            if timestep <= latest_action or timestep in incoming_timesteps:
-                continue
-            future_action_queue.put(existing)
-
-        with self.action_queue_lock:
-            self.action_queue = future_action_queue
-            new_queue_size = self.action_queue.qsize()
-
-        if incoming_actions:
-            self.logger.info(
-                "Merged action chunk | "
-                f"incoming={incoming_actions[0].get_timestep()}:{incoming_actions[-1].get_timestep()} | "
-                f"latest_action={latest_action} | queue_size={new_queue_size}"
-            )
-
-    def receive_actions(self):
-        self.logger.info("Action receiver thread started")
-        while self.running:
-            try:
-                actions_chunk = self.stub.GetActions(services_pb2.Empty())
-                if len(actions_chunk.data) == 0:
-                    continue
-
-                timed_actions: list[TimedAction] = pickle.loads(actions_chunk.data)  # nosec
-                if not timed_actions:
-                    continue
-
-                self.action_chunk_size = max(1, len(timed_actions))
-                self.logger.info(
-                    "Received action chunk | "
-                    f"size={len(timed_actions)} | "
-                    f"timesteps={timed_actions[0].get_timestep()}:{timed_actions[-1].get_timestep()}"
-                )
-                self._aggregate_action_queues(timed_actions)
-                self.observation_in_flight.clear()
-                self.must_go.set()
-            except grpc.RpcError as err:
-                if self.running:
-                    self.logger.error(f"Error receiving actions: {err}")
-                return
-            except Exception as err:
-                if self.running:
-                    self.logger.exception(f"Unexpected error while receiving actions: {err}")
-                return
-
-    def _ready_to_send_observation(self) -> bool:
-        if self.observation_in_flight.is_set():
-            return False
-        with self.action_queue_lock:
-            queue_size = self.action_queue.qsize()
-        chunk_size = max(self.action_chunk_size, 1)
-        return queue_size / chunk_size <= self.cfg.chunk_size_threshold
-
-    def _send_observation(self, observation: dict[str, Any]):
-        with self.latest_action_lock:
-            timestep = max(self.latest_action, 0)
-
-        with self.action_queue_lock:
-            queue_size = self.action_queue.qsize()
-        # MetaWorld async eval only sends observations at replanning points.
-        # Mark them as must_go so server-side similarity filtering does not drop
-        # the request and deadlock the client while it waits for the next chunk.
-        must_go = True
-
-        timed_observation = TimedObservation(
-            timestamp=time.time(),
-            timestep=timestep,
-            observation=self._flatten_observation(observation),
-            must_go=must_go,
-        )
-
-        observation_bytes = pickle.dumps(timed_observation)
-        observation_iterator = send_bytes_in_chunks(
-            observation_bytes,
-            services_pb2.Observation,
-            log_prefix="[CLIENT] Observation",
-            silent=True,
-        )
-        self.observation_in_flight.set()
-        try:
-            self.logger.info(
-                "Sending observation | "
-                f"timestep={timed_observation.get_timestep()} | "
-                f"must_go={timed_observation.must_go} | queue_size={queue_size}"
-            )
-            self.stub.SendObservations(observation_iterator)
-        except Exception:
-            self.observation_in_flight.clear()
-            raise
-
-        self.must_go.clear()
-
-        fps_metrics = self.fps_tracker.calculate_fps_metrics(timed_observation.timestamp)
-        self.logger.debug(
-            f"Sent observation #{timed_observation.get_timestep()} | "
-            f"avg_fps={fps_metrics['avg_fps']:.2f} | target={fps_metrics['target_fps']:.2f}"
-        )
-
-    def _pop_action(self) -> torch.Tensor | None:
-        with self.action_queue_lock:
-            if self.action_queue.empty():
-                self.action_queue_size.append(0)
-                return None
-
-            self.action_queue_size.append(self.action_queue.qsize())
-            timed_action = self.action_queue.get_nowait()
-            remaining_queue_size = self.action_queue.qsize()
-
-        with self.latest_action_lock:
-            self.latest_action = timed_action.get_timestep()
-        self.logger.info(
-            "Executing action | "
-            f"timestep={timed_action.get_timestep()} | remaining_queue_size={remaining_queue_size}"
-        )
-        return timed_action.get_action()
-
-    def _run_episode(self, env: SingleMetaworldEnv, episode_seed: int) -> dict[str, Any]:
+    def _run_episode(
+        self,
+        env: SingleMetaworldEnv,
+        *,
+        task_name: str,
+        task_description: str,
+        episode_seed: int,
+    ) -> dict[str, Any]:
         self._reset_episode_state()
-        observation, info = env.reset(seed=episode_seed)
-        self._ensure_policy_setup(observation)
+        self.robot.start_episode(env, task_description=task_description, seed=episode_seed)
         self.logger.info(
-            f"Episode started | task={self._current_task_name} | seed={episode_seed} | "
+            f"Episode started | task={task_name} | seed={episode_seed} | "
             f"max_steps={self.cfg.env.episode_length}"
         )
 
-        reward_sum = 0.0
-        success = False
-        steps = 0
-        max_steps = self.cfg.env.episode_length
-        dt = 1 / self.cfg.env.fps
-
-        while self.running and steps < max_steps:
+        while self.running and not self.robot.episode_finished:
             loop_start = time.perf_counter()
 
-            action = self._pop_action()
-            if action is not None:
-                action_np = action.detach().cpu().numpy()
-                observation, reward, terminated, truncated, info = env.step(action_np)
-                reward_sum += float(reward)
-                success = success or bool(info.get("is_success", False))
-                steps += 1
-                if terminated or truncated:
-                    break
+            if self.actions_available():
+                self.control_loop_action()
 
             if self._ready_to_send_observation():
-                self._send_observation(observation)
+                self.control_loop_observation(task=task_description)
 
-            time.sleep(max(0.0, dt - (time.perf_counter() - loop_start)))
+            time.sleep(max(0.0, self.config.environment_dt - (time.perf_counter() - loop_start)))
 
-        return {
-            "task": self._current_task_name,
-            "seed": episode_seed,
-            "steps": steps,
-            "reward_sum": reward_sum,
-            "success": success,
-        }
+        return self.robot.build_result(task_name, episode_seed)
 
     def evaluate(self) -> list[dict[str, Any]]:
-        self.start()
+        if not self.start():
+            return []
+
         action_receiver_thread = threading.Thread(target=self.receive_actions, daemon=True)
         action_receiver_thread.start()
+        self.start_barrier.wait()
 
         results: list[dict[str, Any]] = []
         task_names = _expand_metaworld_tasks(self.cfg.env.task)
 
         try:
             for task_name in task_names:
-                self._current_task_name = task_name
-                self._current_task_description = TASK_DESCRIPTIONS.get(task_name, task_name)
-
+                task_description = TASK_DESCRIPTIONS.get(task_name, task_name)
                 env = SingleMetaworldEnv(task=task_name, **self.cfg.env.gym_kwargs)
                 try:
                     for episode_idx in range(self.cfg.n_episodes):
                         episode_seed = self.cfg.seed + episode_idx
-                        result = self._run_episode(env, episode_seed)
+                        result = self._run_episode(
+                            env,
+                            task_name=task_name,
+                            task_description=task_description,
+                            episode_seed=episode_seed,
+                        )
                         results.append(result)
                         self.logger.info(
                             f"Task={task_name} | episode={episode_idx} | "
