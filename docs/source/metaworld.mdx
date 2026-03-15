@@ -73,6 +73,54 @@ lerobot-eval \
 
 This will run episodes and return per-task success rates using the standard Meta-World evaluation keys.
 
+## Async MetaWorld evaluation
+
+You can also decouple simulation from policy inference using the async inference stack:
+
+- `policy_server` runs the policy and returns action chunks.
+- `metaworld_client` runs the MetaWorld environments locally, streams observations to the server, and executes returned actions.
+
+Start the async policy server first:
+
+```bash
+python -m lerobot.async_inference.policy_server \
+  --host=0.0.0.0 \
+  --port=8080 \
+  --fps=80
+```
+
+Then launch the MetaWorld async client:
+
+```bash
+python -m lerobot.async_inference.metaworld_client \
+  --policy.path=/path/to/checkpoint/pretrained_model \
+  --server_address=127.0.0.1:8080 \
+  --env.task=medium \
+  --env.fps=80 \
+  --actions_per_chunk=15 \
+  --chunk_size_threshold=0.5 \
+  --n_episodes=2
+```
+
+Notes:
+
+- `--env.task` accepts either a difficulty group (`medium`, `hard`, ...) or a comma-separated list of task names.
+- `--env.fps` controls the local simulation control rate.
+- `--actions_per_chunk` is the maximum number of actions the server sends back per request. The effective value is capped by the policy's own `chunk_size`.
+- `--chunk_size_threshold` controls when the client starts requesting the next chunk. With `actions_per_chunk=15` and `chunk_size_threshold=0.5`, replanning starts when the local queue shrinks to about 7 remaining actions.
+- For the cleanest timing semantics, keep `policy_server --fps` aligned with `metaworld_client --env.fps`.
+
+### How async replanning works
+
+The MetaWorld async client follows the same control model as `RobotClient`:
+
+1. Execute the current local action queue.
+2. Once the queue falls below `chunk_size_threshold`, send a fresh observation.
+3. The server keeps only the latest useful observation and may filter out similar ones.
+4. When a new chunk arrives, merge it into the local queue and continue execution.
+
+This means it is normal to see more observations sent than actually enqueued for inference. Filtered observations are part of the design and help avoid recomputing nearly identical plans.
+
 ## Practical tips
 
 - If you care about generalization, run on the full MT50 suite — it’s intentionally challenging and reveals strengths/weaknesses better than a few narrow tasks.

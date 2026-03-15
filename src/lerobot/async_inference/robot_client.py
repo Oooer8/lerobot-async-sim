@@ -356,6 +356,9 @@ class RobotClient:
                     )
 
             except grpc.RpcError as e:
+                if not self.running and e.code() == grpc.StatusCode.CANCELLED:
+                    self.logger.debug("Action receiver stopped because the channel was closed")
+                    return
                 self.logger.error(f"Error receiving actions: {e}")
 
     def actions_available(self):

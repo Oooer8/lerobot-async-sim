@@ -74,11 +74,11 @@ def receive_bytes_in_chunks(iterator, queue: Queue | None, shutdown_event: MpEve
     bytes_buffer = io.BytesIO()
     step = 0
 
-    logging.info(f"{log_prefix} Starting receiver")
+    logging.debug(f"{log_prefix} Starting receiver")
     for item in iterator:
         logging.debug(f"{log_prefix} Received item")
         if shutdown_event.is_set():
-            logging.info(f"{log_prefix} Shutting down receiver")
+            logging.debug(f"{log_prefix} Shutting down receiver")
             return
 
         if item.transfer_state == TransferState.TRANSFER_BEGIN:

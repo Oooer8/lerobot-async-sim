@@ -212,7 +212,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             timed_observation  # wrapping a RawObservation
         )
         queue_size = self.observation_queue.qsize()
-        self.logger.info(
+        log_fn = self.logger.info if enqueued or timed_observation.must_go else self.logger.debug
+        log_fn(
             "Observation received | "
             f"timestep={obs_timestep} | must_go={timed_observation.must_go} | "
             f"enqueued={enqueued} | queue_size={queue_size}"
