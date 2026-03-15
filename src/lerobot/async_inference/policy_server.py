@@ -38,6 +38,7 @@ import draccus
 import grpc
 import torch
 
+from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.processor import (
     PolicyAction,
@@ -151,9 +152,19 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.rename_map = policy_specs.rename_map
 
         policy_class = get_policy_class(self.policy_type)
+        policy_config = PreTrainedConfig.from_pretrained(policy_specs.pretrained_name_or_path)
+        if getattr(policy_config, "compile_model", False):
+            self.logger.warning(
+                "Disabling `compile_model` for async inference server to avoid repeated "
+                "CUDA graph capture failures during streaming evaluation."
+            )
+            policy_config.compile_model = False
 
         start = time.perf_counter()
-        self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
+        self.policy = policy_class.from_pretrained(
+            policy_specs.pretrained_name_or_path,
+            config=policy_config,
+        )
         self.policy.to(self.device)
 
         # Load preprocessor and postprocessor, overriding device to match requested device
@@ -298,6 +309,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     def _enqueue_observation(self, obs: TimedObservation) -> bool:
         """Enqueue an observation if it must go through processing, otherwise skip it.
         Observations not in queue are never run through the policy network"""
+        if not obs.must_go and not self.observation_queue.empty():
+            pending_obs = self.observation_queue.queue[-1]
+            if pending_obs.get_timestep() == obs.get_timestep():
+                self.logger.debug(
+                    f"Skipping observation #{obs.get_timestep()} - matching timestep already pending!"
+                )
+                return False
 
         if (
             obs.must_go
