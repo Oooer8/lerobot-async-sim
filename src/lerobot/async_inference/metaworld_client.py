@@ -289,12 +289,16 @@ class AsyncMetaWorldClient:
                     continue
 
                 self.action_chunk_size = max(1, len(timed_actions))
-                self.observation_in_flight.clear()
                 self._aggregate_action_queues(timed_actions)
+                self.observation_in_flight.clear()
                 self.must_go.set()
             except grpc.RpcError as err:
                 if self.running:
                     self.logger.error(f"Error receiving actions: {err}")
+                return
+            except Exception as err:
+                if self.running:
+                    self.logger.exception(f"Unexpected error while receiving actions: {err}")
                 return
 
     def _ready_to_send_observation(self) -> bool:
