@@ -105,6 +105,7 @@ python -m lerobot.async_inference.metaworld_client \
 Notes:
 
 - `--env.task` accepts either a difficulty group (`medium`, `hard`, ...) or a comma-separated list of task names.
+  Built-in groups are `all`, `easy`, `medium`, `hard`, and `very_hard`.
 - `--env.fps` controls the local simulation control rate.
 - `--actions_per_chunk` is the maximum number of actions the server sends back per request. The effective value is capped by the policy's own `chunk_size`.
 - `--chunk_size_threshold` controls when the client starts requesting the next chunk. With `actions_per_chunk=15` and `chunk_size_threshold=0.5`, replanning starts when the local queue shrinks to about 7 remaining actions.
@@ -120,6 +121,65 @@ The MetaWorld async client follows the same control model as `RobotClient`:
 4. When a new chunk arrives, merge it into the local queue and continue execution.
 
 This means it is normal to see more observations sent than actually enqueued for inference. Filtered observations are part of the design and help avoid recomputing nearly identical plans.
+
+### Async CLI reference
+
+#### `metaworld_client` core async parameters
+
+| Parameter | Default | Choices / constraints | Description |
+|---|---:|---|---|
+| `--server_address` | `localhost:8080` | Any `host:port` | gRPC address of the policy server |
+| `--n_episodes` | `1` | Positive integer | Number of episodes to run per task |
+| `--seed` | `0` | Integer | Base random seed for evaluation |
+| `--actions_per_chunk` | `50` | Positive integer | Maximum number of actions requested from the server per response |
+| `--chunk_size_threshold` | `0.5` | Float in `[0, 1]` | Start requesting a new chunk when `queue_size / effective_chunk_size <= threshold` |
+| `--aggregate_fn_name` | `weighted_average` | `weighted_average`, `latest_only`, `average`, `conservative` | How overlapping actions are merged locally |
+| `--client_device` | `cpu` | Any torch device string | Device used for received action tensors on the client |
+| `--debug_visualize_queue_size` | `false` | `true` / `false` | Plot the local action queue size after evaluation |
+
+#### MetaWorld environment parameters
+
+| Parameter | Default | Choices / constraints | Description |
+|---|---:|---|---|
+| `--env.task` | `metaworld-push-v2` | Difficulty group or task name, comma-separated allowed | Examples: `all`, `medium`, `hard`, `hammer-v3,push-wall-v3` |
+| `--env.fps` | `80` | Positive integer | Local simulation control rate |
+| `--env.episode_length` | `400` | Positive integer | Maximum environment steps per episode |
+| `--env.obs_type` | `pixels_agent_pos` | `pixels`, `pixels_agent_pos` | Observation layout used by the client |
+| `--env.render_mode` | `rgb_array` | Effectively `rgb_array` in current setup | MetaWorld render mode |
+| `--env.multitask_eval` | `true` | `true` / `false` | MetaWorld multitask evaluation config flag |
+| `--env.disable_env_checker` | `true` | `true` / `false` | Gym env checker toggle |
+| `--env.max_parallel_tasks` | `1` | Positive integer | Present in config; current async client evaluates tasks sequentially |
+
+#### Policy parameters
+
+`--policy.path` is required. Other `--policy.*` arguments override values stored in the checkpoint config.
+
+| Parameter | Default | Choices / constraints | Description |
+|---|---:|---|---|
+| `--policy.path` | Required | Local directory or HF repo id | Path to the `pretrained_model` directory or Hub model |
+| `--policy.device` | From checkpoint | Any torch device string | Device used to load the policy |
+| `--policy.compile_model` | From checkpoint | `true` / `false` | Whether the policy is compiled; async server currently disables this at load time for stability |
+| `--policy.dtype` | Policy-specific, e.g. `float32` for `pi0` | Depends on policy | Inference dtype |
+| `--policy.chunk_size` | Policy-specific, e.g. `50` for `pi0` | Positive integer | Maximum number of actions the policy can predict in one call |
+| `--policy.n_action_steps` | Policy-specific, e.g. `50` for `pi0` | Positive integer, typically `<= chunk_size` | Mainly used by local `select_action()` paths; not the main limiter in async server mode |
+
+For async inference, the effective returned chunk size is:
+
+```text
+effective_chunk_size = min(policy.chunk_size, actions_per_chunk)
+```
+
+So if your checkpoint has `--policy.chunk_size=15` and you launch the async client with `--actions_per_chunk=50`, the server still returns at most `15` actions per request.
+
+#### `policy_server` parameters
+
+| Parameter | Default | Choices / constraints | Description |
+|---|---:|---|---|
+| `--host` | `localhost` | Any bind address | Address used by the gRPC server |
+| `--port` | `8080` | Integer in `[1, 65535]` | Port used by the gRPC server |
+| `--fps` | `30` | Positive integer | Server-side action timestamp spacing; best kept aligned with `--env.fps` |
+| `--inference_latency` | `1 / 30 ≈ 0.0333` | Non-negative float | Target inference latency config |
+| `--obs_queue_timeout` | `2` | Non-negative float | Timeout while waiting for a new observation |
 
 ## Practical tips
 
