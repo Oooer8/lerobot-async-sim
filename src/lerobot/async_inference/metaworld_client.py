@@ -328,8 +328,11 @@ class AsyncMetaWorldClient:
             timestep = max(self.latest_action, 0)
 
         with self.action_queue_lock:
-            must_go = self.must_go.is_set() and self.action_queue.empty()
             queue_size = self.action_queue.qsize()
+        # MetaWorld async eval only sends observations at replanning points.
+        # Mark them as must_go so server-side similarity filtering does not drop
+        # the request and deadlock the client while it waits for the next chunk.
+        must_go = True
 
         timed_observation = TimedObservation(
             timestamp=time.time(),
@@ -357,8 +360,7 @@ class AsyncMetaWorldClient:
             self.observation_in_flight.clear()
             raise
 
-        if must_go:
-            self.must_go.clear()
+        self.must_go.clear()
 
         fps_metrics = self.fps_tracker.calculate_fps_metrics(timed_observation.timestamp)
         self.logger.debug(
