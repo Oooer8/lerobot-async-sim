@@ -208,9 +208,16 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"Deserialization time: {deserialize_time:.6f}s"
         )
 
-        if not self._enqueue_observation(
+        enqueued = self._enqueue_observation(
             timed_observation  # wrapping a RawObservation
-        ):
+        )
+        queue_size = self.observation_queue.qsize()
+        self.logger.info(
+            "Observation received | "
+            f"timestep={obs_timestep} | must_go={timed_observation.must_go} | "
+            f"enqueued={enqueued} | queue_size={queue_size}"
+        )
+        if not enqueued:
             self.logger.debug(f"Observation #{obs_timestep} has been filtered out")
 
         return services_pb2.Empty()

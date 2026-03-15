@@ -276,8 +276,17 @@ class AsyncMetaWorldClient:
 
         with self.action_queue_lock:
             self.action_queue = future_action_queue
+            new_queue_size = self.action_queue.qsize()
+
+        if incoming_actions:
+            self.logger.info(
+                "Merged action chunk | "
+                f"incoming={incoming_actions[0].get_timestep()}:{incoming_actions[-1].get_timestep()} | "
+                f"latest_action={latest_action} | queue_size={new_queue_size}"
+            )
 
     def receive_actions(self):
+        self.logger.info("Action receiver thread started")
         while self.running:
             try:
                 actions_chunk = self.stub.GetActions(services_pb2.Empty())
@@ -289,6 +298,11 @@ class AsyncMetaWorldClient:
                     continue
 
                 self.action_chunk_size = max(1, len(timed_actions))
+                self.logger.info(
+                    "Received action chunk | "
+                    f"size={len(timed_actions)} | "
+                    f"timesteps={timed_actions[0].get_timestep()}:{timed_actions[-1].get_timestep()}"
+                )
                 self._aggregate_action_queues(timed_actions)
                 self.observation_in_flight.clear()
                 self.must_go.set()
@@ -315,6 +329,7 @@ class AsyncMetaWorldClient:
 
         with self.action_queue_lock:
             must_go = self.must_go.is_set() and self.action_queue.empty()
+            queue_size = self.action_queue.qsize()
 
         timed_observation = TimedObservation(
             timestamp=time.time(),
@@ -332,6 +347,11 @@ class AsyncMetaWorldClient:
         )
         self.observation_in_flight.set()
         try:
+            self.logger.info(
+                "Sending observation | "
+                f"timestep={timed_observation.get_timestep()} | "
+                f"must_go={timed_observation.must_go} | queue_size={queue_size}"
+            )
             self.stub.SendObservations(observation_iterator)
         except Exception:
             self.observation_in_flight.clear()
@@ -354,15 +374,24 @@ class AsyncMetaWorldClient:
 
             self.action_queue_size.append(self.action_queue.qsize())
             timed_action = self.action_queue.get_nowait()
+            remaining_queue_size = self.action_queue.qsize()
 
         with self.latest_action_lock:
             self.latest_action = timed_action.get_timestep()
+        self.logger.info(
+            "Executing action | "
+            f"timestep={timed_action.get_timestep()} | remaining_queue_size={remaining_queue_size}"
+        )
         return timed_action.get_action()
 
     def _run_episode(self, env: SingleMetaworldEnv, episode_seed: int) -> dict[str, Any]:
         self._reset_episode_state()
         observation, info = env.reset(seed=episode_seed)
         self._ensure_policy_setup(observation)
+        self.logger.info(
+            f"Episode started | task={self._current_task_name} | seed={episode_seed} | "
+            f"max_steps={self.cfg.env.episode_length}"
+        )
 
         reward_sum = 0.0
         success = False
