@@ -174,6 +174,7 @@ class AsyncMetaWorldClient:
         self.latest_action_lock = threading.Lock()
         self.latest_action = -1
         self.action_chunk_size = cfg.actions_per_chunk
+        self.observation_in_flight = threading.Event()
         self.must_go = threading.Event()
         self.must_go.set()
 
@@ -202,6 +203,7 @@ class AsyncMetaWorldClient:
             self.latest_action = -1
         with self.action_queue_lock:
             self.action_queue = Queue()
+        self.observation_in_flight.clear()
         self.must_go.set()
 
     def _ensure_policy_setup(self, first_observation: dict[str, Any]):
@@ -286,6 +288,7 @@ class AsyncMetaWorldClient:
                 if not timed_actions:
                     continue
 
+                self.observation_in_flight.clear()
                 self._aggregate_action_queues(timed_actions)
                 self.must_go.set()
             except grpc.RpcError as err:
@@ -294,6 +297,8 @@ class AsyncMetaWorldClient:
                 return
 
     def _ready_to_send_observation(self) -> bool:
+        if self.observation_in_flight.is_set():
+            return False
         with self.action_queue_lock:
             queue_size = self.action_queue.qsize()
         chunk_size = max(self.action_chunk_size, 1)
@@ -320,7 +325,12 @@ class AsyncMetaWorldClient:
             log_prefix="[CLIENT] Observation",
             silent=True,
         )
-        self.stub.SendObservations(observation_iterator)
+        self.observation_in_flight.set()
+        try:
+            self.stub.SendObservations(observation_iterator)
+        except Exception:
+            self.observation_in_flight.clear()
+            raise
 
         if must_go:
             self.must_go.clear()
