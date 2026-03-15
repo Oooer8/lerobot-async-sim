@@ -69,7 +69,6 @@ from lerobot.envs.metaworld import (
     TASK_DESCRIPTIONS,
     MetaworldEnv as SingleMetaworldEnv,
 )
-from lerobot.processor import PolicyFeature
 from lerobot.transport import (
     services_pb2,  # type: ignore
     services_pb2_grpc,  # type: ignore
