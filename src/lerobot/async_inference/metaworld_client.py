@@ -288,6 +288,7 @@ class AsyncMetaWorldClient:
                 if not timed_actions:
                     continue
 
+                self.action_chunk_size = max(1, len(timed_actions))
                 self.observation_in_flight.clear()
                 self._aggregate_action_queues(timed_actions)
                 self.must_go.set()
@@ -368,9 +369,6 @@ class AsyncMetaWorldClient:
         while self.running and steps < max_steps:
             loop_start = time.perf_counter()
 
-            if self._ready_to_send_observation():
-                self._send_observation(observation)
-
             action = self._pop_action()
             if action is not None:
                 action_np = action.detach().cpu().numpy()
@@ -380,6 +378,9 @@ class AsyncMetaWorldClient:
                 steps += 1
                 if terminated or truncated:
                     break
+
+            if self._ready_to_send_observation():
+                self._send_observation(observation)
 
             time.sleep(max(0.0, dt - (time.perf_counter() - loop_start)))
 
