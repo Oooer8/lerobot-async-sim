@@ -35,7 +35,7 @@ from lerobot.policies import (  # noqa: F401
     VQBeTConfig,
 )
 from lerobot.robots.robot import Robot
-from lerobot.utils.constants import OBS_IMAGES, OBS_STATE, OBS_STR
+from lerobot.utils.constants import OBS_IMAGE, OBS_IMAGES, OBS_STATE, OBS_STR
 from lerobot.utils.utils import init_logging
 
 Action = torch.Tensor
@@ -68,7 +68,7 @@ def map_robot_keys_to_lerobot_features(robot: Robot) -> dict[str, dict]:
 
 
 def is_image_key(k: str) -> bool:
-    return k.startswith(OBS_IMAGES)
+    return k == OBS_IMAGE or k.startswith(OBS_IMAGES)
 
 
 def resize_robot_observation_image(image: torch.tensor, resize_dims: tuple[int, int, int]) -> torch.tensor:

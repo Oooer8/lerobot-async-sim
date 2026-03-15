@@ -23,6 +23,7 @@ from lerobot.async_inference.helpers import (
     FPSTracker,
     TimedAction,
     TimedObservation,
+    is_image_key,
     observations_similar,
     prepare_image,
     prepare_raw_observation,
@@ -30,7 +31,7 @@ from lerobot.async_inference.helpers import (
     resize_robot_observation_image,
 )
 from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
+from lerobot.utils.constants import OBS_IMAGE, OBS_IMAGES, OBS_STATE
 
 # ---------------------------------------------------------------------
 # FPSTracker
@@ -410,6 +411,10 @@ def test_raw_observation_to_observation_applies_rename_map_before_image_resize()
 
     assert "observation.image" in observation
     assert observation["observation.image"].shape == (1, 3, 224, 224)
+
+
+def test_is_image_key_supports_single_image_key():
+    assert is_image_key(OBS_IMAGE)
 
 
 @torch.no_grad()
