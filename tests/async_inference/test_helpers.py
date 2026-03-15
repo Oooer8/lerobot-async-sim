@@ -377,6 +377,41 @@ def test_raw_observation_to_observation_with_non_tensor_data():
     assert isinstance(observation["task"], str)
 
 
+def test_raw_observation_to_observation_applies_rename_map_before_image_resize():
+    """Image keys should be renamed before matching policy image features."""
+    robot_obs = {"agent_pos_0": 1.0, "agent_pos_1": 2.0, "agent_pos_2": 3.0, "agent_pos_3": 4.0}
+    robot_obs["top"] = np.zeros((64, 64, 3), dtype=np.uint8)
+
+    lerobot_features = {
+        OBS_STATE: {
+            "dtype": "float32",
+            "shape": [4],
+            "names": ["agent_pos_0", "agent_pos_1", "agent_pos_2", "agent_pos_3"],
+        },
+        f"{OBS_IMAGES}.top": {
+            "dtype": "image",
+            "shape": [64, 64, 3],
+            "names": ["height", "width", "channels"],
+        },
+    }
+    policy_image_features = {
+        "observation.image": PolicyFeature(
+            type=FeatureType.VISUAL,
+            shape=(3, 224, 224),
+        )
+    }
+
+    observation = raw_observation_to_observation(
+        robot_obs,
+        lerobot_features,
+        policy_image_features,
+        rename_map={f"{OBS_IMAGES}.top": "observation.image"},
+    )
+
+    assert "observation.image" in observation
+    assert observation["observation.image"].shape == (1, 3, 224, 224)
+
+
 @torch.no_grad()
 def test_raw_observation_to_observation_device_handling():
     """Test that tensors are created (device placement is handled by preprocessor)."""
